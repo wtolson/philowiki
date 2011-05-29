@@ -6,6 +6,9 @@ import httplib2
 from lxml import etree
 import re
 import cPickle
+import time
+
+#class philowiki
 
 _titleCache = {}
 try:
@@ -17,6 +20,10 @@ except:
 def saveTitleCache():
   try:
     with open(".cache", "w") as cacheFile:
+      now = time.time()
+      for title in _titleCache:
+        if _titleCache[title][1] < now:
+          del _titleCache[title]
       cPickle.dump(_titleCache, cacheFile)
   except:
     pass
@@ -97,12 +104,12 @@ def getPreText(ele):
   return _preTextCache[ele]
 
 def getNextTitle(title):
-  if title not in _titleCache:
+  if title not in _titleCache or _titleCache[title][1] < time.time():
     _preTextCache = {}
     root = getPage(title)
-    _titleCache[title] = findFirst(root)
+    _titleCache[title] = (findFirst(root), time.time() + 60*60) # Hour experation
 
-  return _titleCache[title]
+  return _titleCache[title][0]
 
 def main():
   if (len(sys.argv) <= 1):
