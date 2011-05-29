@@ -5,16 +5,30 @@ import urllib
 import httplib2
 from lxml import etree
 import re
+import cPickle
 
-h = httplib2.Http(cache=".cache")
-urlTitle = re.compile(r"^http://en.wikipedia.org/wiki/([^:]*)$")
+_titleCache = {}
+try:
+  with open(".cache", "r") as cacheFile:
+    _titleCache = cPickle.load(cacheFile) 
+except:
+  pass
+
+def saveTitleCache():
+  try:
+    with open(".cache", "w") as cacheFile:
+      cPickle.dump(_titleCache, cacheFile)
+  except:
+    pass
+
+
+_h = httplib2.Http()
+_urlTitle = re.compile(r"^http://en.wikipedia.org/wiki/([^:]*)$")
+_headers = {"User-Agent": "PhiloWiki/1.0"}
 
 def getPage(title):
-  headers = {
-    "User-Agent": "PhiloWiki/1.0"    
-  }
   url = "http://en.wikipedia.org/w/index.php?action=render&title=%s" % (title)
-  resp, content = h.request(url, headers=headers)
+  resp, content = _h.request(url, headers=_headers)
   return etree.fromstring("<root>%s</root>" % (content))
 
 def findFirst(ele, level=0):
@@ -35,7 +49,7 @@ def findFirst(ele, level=0):
         return
 
   if ele.tag == "a":
-    title = urlTitle.findall(ele.attrib["href"])
+    title = _urlTitle.findall(ele.attrib["href"])
     if len(title) and not inParenth(ele):
       return title[0].split("#")[0].split("?")[0]
     else:
@@ -82,6 +96,14 @@ def getPreText(ele):
       
   return _preTextCache[ele]
 
+def getNextTitle(title):
+  if title not in _titleCache:
+    _preTextCache = {}
+    root = getPage(title)
+    _titleCache[title] = findFirst(root)
+
+  return _titleCache[title]
+
 def main():
   if (len(sys.argv) <= 1):
     raise Error("Please specify a start page")
@@ -92,11 +114,10 @@ def main():
   count = 0
   history = []
   while title != "Philosophy":
-    print "->", urllib.unquote(title.replace("_", " "))
+    print urllib.unquote(title.replace("_", " ")), "->",
     history.append(title)
-    _preTextCache = {}
-    root = getPage(title)
-    title = findFirst(root)
+    title = getNextTitle(title)
+    print title
     if title is None:
       print "Found dead end :("
       return 1
@@ -106,6 +127,7 @@ def main():
     count += 1
 
   print "Found Philosophy in %d steps!" % (count)
+  saveTitleCache()
 
   return 0
 
