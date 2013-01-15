@@ -1,152 +1,246 @@
 #!/usr/bin/env python
-
 import sys
-import urllib
-import httplib2
+import json
+import argparse
+
+from os import path
+from time import time
+
+from urllib import unquote
+from urlparse import urljoin, urlsplit
+
+import requests
+from lxml import html
 from lxml import etree
-import re
-import cPickle
-import time
 
-EXP_TIME = 60*60
-_h = httplib2.Http()
-_urlTitle = re.compile(r"^http://en.wikipedia.org/wiki/([^:]*)$")
-_headers = {"User-Agent": "PhiloWiki/1.0"}
-_preTextCache = {}
-_titleCache = {}
+class Cache(object):
+    def __init__(self, exp_time=24*60*60, filename=None):
+        self.exp_time = exp_time
+        self.filename = filename
+        self._cache   = {}
 
-try:
-  with open(".cache", "r") as cacheFile:
-    _titleCache = cPickle.load(cacheFile) 
-except:
-  pass
+    @staticmethod
+    def _normalize(filename):
+        return path.abspath(path.expanduser(filename))
+
+    @classmethod
+    def open(cls, fp, **kwargs):
+        if isinstance(fp, basestring):
+            filename = cls._normalize(fp)
+
+            if not path.isfile(filename):
+                return cls(filename=filename, **kwargs)
+
+            with open(filename) as fp:
+                return cls.open(fp, filename=filename, **kwargs)
+
+        cache = cls(**kwargs)
+
+        for line in fp:
+            cache.set(*json.loads(line))
+
+        return cache
+
+    def save(self, filename=None):
+        if filename is None:
+            filename = self.filename
+
+        if isinstance(filename, basestring):
+            with open(self._normalize(filename), 'w') as fp:
+                return self.save(fp)
+
+        for src, (dst, exp) in self._cache.iteritems():
+            filename.write(json.dumps([src, dst, exp])+'\n')
+
+    def set(self, src, dst, exp=None):
+        if exp is None:
+            exp = time()
+
+        self._cache[src] = (dst, exp)
+
+    def get(self, src):
+        dst, exp = self._cache.get(src, (None, None))
+
+        if dst is None:
+            return None
+
+        if exp + self.exp_time < time():
+            return None
+
+        return dst
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.save()
 
 
-def _getPage(title, parse=True):
-  url = "http://en.wikipedia.org/w/index.php?action=render&title=%s" % (title)
-  resp, content = _h.request(url, headers=_headers)
-  if parse:
-    return etree.fromstring("<root>%s</root>" % (content))
-  else:
-    return (resp, content)
+class Philowiki(object):
+    def __init__(self,
+        cache    = None,
+        hostname = 'en.wikipedia.org',
+    ):
+        if cache is None:
+            cache = Cache()
 
-def _findFirst(ele, level=0):
-  for item in ["table", "i"]:
-    if ele.tag == item:
-      return
+        self.cache    = cache
+        self.hostname = hostname
 
-  if "class" in ele.attrib:
-    classes = ele.attrib["class"].split(" ")
-    for item in ["dablink", "tright", "rellink", "seealso"]:
-      if item in classes:
-        return
+        self.session = requests.Session()
+        self.session.headers.update({'User-Agent': 'PhiloWiki/1.1'})
 
-  if "id" in ele.attrib:
-    id = ele.attrib["id"]
-    for item in ["coordinates"]:
-      if item == id:
-        return
+    def get_page(self, title):
+        params = {
+            'action':   'mobileview',
+            'format':   'json',
+            'prop':     'text',
+            'sections': 'all',
+            'page':     title
+        }
 
-  if ele.tag == "a":
-    title = _urlTitle.findall(ele.attrib["href"])
-    if len(title) and not _inParenth(ele):
-      return title[0].split("#")[0].split("?")[0]
-    else:
-      return
+        resp = self.session.get(
+            'http://%s/w/api.php' % self.hostname,
+            params = params
+        )
 
-  #print level*"> " + ele.tag#, ele.attrib
+        if resp.status_code != requests.codes.ok:
+            return None
 
-  for child in ele.iterchildren(tag=etree.Element):
-    result = _findFirst(child, level+1)
-    if result:
-      return result
+        sections = resp.json()['mobileview']['sections']
+        return '<div>%s</div>' % ''.join([s['text'] for s in sections])
 
-def _inParenth(ele):
-  text = _getPreText(ele)
-  count = 0
-  for char in reversed(text):
-    if char == "(":
-      if count:
-        count -= 1
-      else:
-        return True
-    elif char == ")":
-      count += 1
-  return False
+    def normalize_title(self, title):
+        if ':' in title:
+            return None
 
-def _getPreText(ele):
-  if ele not in _preTextCache:
-    parent = ele.getparent()
-    text = []
-    if parent is not None:
-      text.append(_getPreText(parent))
-      if parent.text:
-        text.append(parent.text)
-      for child in parent.iterchildren():
-        if child is ele:
-          break
-        for t in child.itertext():
-          text.append(t)
-        if child.tail:
-          text.append(child.tail)
-    
-    _preTextCache[ele] = "".join(text)
-      
-  return _preTextCache[ele]
+        return title.replace(' ', '_')
 
-def saveTitleCache():
-  try:
-    with open(".cache", "w") as cacheFile:
-      now = time.time()
-      for title in _titleCache:
-        if _titleCache[title][1] < now:
-          del _titleCache[title]
-      cPickle.dump(_titleCache, cacheFile)
-      return True
-  except:
-    return False
+    def find_link(self, content):
+        return self._find_link(html.fromstring(content))
 
-def getNextTitle(title):
-  if title not in _titleCache or _titleCache[title][1] < time.time():
-    _preTextCache = {}
-    root = _getPage(title)
-    _titleCache[title] = (_findFirst(root), time.time() + EXP_TIME) # Hour experation
+    def _extract_title(self, href):
+        href = urlsplit(urljoin('http://%s/' % self.hostname, href))
 
-  return _titleCache[title][0]
+        if href.hostname != self.hostname:
+            return None
 
-def __enter__():
-  pass
+        if not href.path.startswith('/wiki/'):
+            return None
 
-def __exit__(exc_type, exc_value, traceback):
-  saveTitleCache()
+        title = unquote(href.path[len('/wiki/'):])
+        return self.normalize_title(title)
+
+    def _find_link(self, el):
+        if el.tag in ['table', 'i']:
+            return
+
+        for c in el.attrib.get('class', '').split():
+            if c in ['dablink', 'tright', 'rellink', 'seealso']:
+                return
+
+        if el.attrib.get('id') == 'coordinates':
+            return
+
+        if el.tag == 'a':
+            title = self._extract_title(el.attrib.get('href', ''))
+            if title:
+                return title
+
+        for child in el.iterchildren(tag=etree.Element):
+            title = self._find_link(child)
+
+            if title is None:
+                continue
+
+            return title
+
+    def _cache_key(self, title):
+        return '%s:%s' % (self.hostname, title)
+
+    def next_title(self, title):
+        next = self.cache.get(self._cache_key(title))
+
+        if next is not None:
+            return next
+
+        page = self.get_page(title)
+
+        if page is None:
+            return None
+
+        next = self.find_link(page)
+        if next is None:
+            return None
+
+        self.cache.set(self._cache_key(title), next)
+        return next
+
+    def crawl(self, title, destination='Philosophy'):
+        title = self.normalize_title(title)
+        if not title:
+            print 'Not a valid page title'
+            return
+
+        count = 0
+        history = []
+
+        while title != destination:
+            history.append(title)
+
+            sys.stdout.write('%s -> ' % title)
+            sys.stdout.flush()
+
+            title = self.next_title(title)
+            sys.stdout.write('%s\n' % title)
+
+            if title is None:
+                print 'Found dead end :('
+                return
+
+            if title in history:
+                print 'Found infinate loop!'
+                return
+
+            count += 1
+
+        print 'Found %s in %d steps!' % (destination, count)
+
 
 def main():
-  if (len(sys.argv) <= 1):
-    raise Error("Please specify a start page")
-    return 1
-  
-  title = urllib.quote("_".join(sys.argv[1:]))
-  
-  count = 0
-  history = []
-  while title != "Philosophy":
-    print urllib.unquote(title.replace("_", " ")), "->",
-    history.append(title)
-    title = getNextTitle(title)
-    print title
-    if title is None:
-      print "Found dead end :("
-      return 1
-    if title in history:
-      print "Found infinate loop!"
-      return 1
-    count += 1
+    parser = argparse.ArgumentParser(description='It all leads to Philosophy.')
 
-  print "Found Philosophy in %d steps!" % (count)
+    parser.add_argument('start',
+        metavar = 'START',
+        help    = 'page to start at'
+    )
 
-  saveTitleCache()
+    parser.add_argument('-e', '--end',
+        default = 'Philosophy',
+        help    = 'page to end at (default: Philosophy)'
+    )
 
-  return 0
+    parser.add_argument('-c', '--cache',
+        default = '~/.philowikicache',
+        help    = 'cache file (default: ~/.philowikicache)'
+    )
+
+    parser.add_argument('--exp',
+        type    = int,
+        default = 24*60*60,
+        help    = 'experation time in seconds (default: 1 day)'
+    )
+
+    parser.add_argument('--host',
+        default = 'en.wikipedia.org',
+        help    = 'host to crawl (default: en.wikipedia.org)'
+    )
+
+    args = parser.parse_args()
+
+    with Cache.open(args.cache, exp_time=args.exp) as cache:
+        pw = Philowiki(cache, args.host)
+        pw.crawl(args.start, args.end)
 
 if __name__ == '__main__':
-  main()
+    main()

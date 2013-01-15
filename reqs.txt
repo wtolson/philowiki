@@ -1,0 +1,2 @@
+lxml==3.1beta1
+requests==1.1.0
